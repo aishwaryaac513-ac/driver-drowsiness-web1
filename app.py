@@ -322,12 +322,19 @@ col1, col2 = st.columns([3, 1])
 
 with col1:
     ctx = webrtc_streamer(
-        key="drowsiness-detection",
-        mode=WebRtcMode.SENDRECV,
-        video_processor_factory=DrowsinessProcessor,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
+    key="drowsiness-detection",
+    mode=WebRtcMode.SENDRECV,
+    video_processor_factory=DrowsinessProcessor,
+    media_stream_constraints={
+        "video": {
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+            "frameRate": {"ideal": 15}
+        },
+        "audio": False,
+    },
+    async_processing=False,
+)
 
 with col2:
     st.subheader("Status")
