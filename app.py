@@ -1,34 +1,44 @@
 """
-Driver Drowsiness Detection - Web App
---------------------------------------
-Browser-based version of the drowsiness detector. Uses streamlit-webrtc to
-access the user's webcam directly in-browser, and runs the same MediaPipe
-FaceLandmarker + EAR/MAR/head-pose logic as the desktop script.
+Driver Drowsiness Detection System
+------------------------------------
+Uses MediaPipe's FaceLandmarker (Tasks API) to track facial landmarks in real
+time from a webcam, computes the Eye Aspect Ratio (EAR) and Mouth Aspect
+Ratio (MAR), and raises a drowsiness / yawn alert when thresholds are
+crossed for a sustained number of frames.
 
-Run locally:
-    streamlit run app.py
+Setup (one-time): download the face landmark model file into this folder:
+    python -c "import urllib.request; urllib.request.urlretrieve('https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task', 'face_landmarker.task')"
 
-Deploy: push this folder to GitHub and deploy on Streamlit Community Cloud
-or Hugging Face Spaces (see README.md for steps).
+Run:
+    python drowsiness_detector.py
+
+Controls:
+    q - quit
 """
 
 import time
+import threading
+import winsound
 from collections import deque
 
-import av
 import cv2
 import numpy as np
-import streamlit as st
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 
 # ---------------------------------------------------------------------------
-# Configuration (same defaults as the desktop version)
+# Configuration
 # ---------------------------------------------------------------------------
 MODEL_PATH = "face_landmarker.task"
 
+EAR_THRESHOLD = 0.21          # below this -> eye considered "closed"
+EAR_CONSEC_FRAMES = 20        # consecutive closed-eye frames -> drowsy alert
+MAR_THRESHOLD = 0.6           # above this -> mouth considered "open" (yawn)
+MAR_CONSEC_FRAMES = 15        # consecutive open-mouth frames -> yawn alert
+SMOOTHING_WINDOW = 5          # frames to average EAR/MAR over (reduces jitter)
+
+# Landmark indices (same 468-point topology as before)
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 MOUTH_LEFT = 78
@@ -36,6 +46,7 @@ MOUTH_RIGHT = 308
 MOUTH_TOP_OUTER = 0
 MOUTH_BOTTOM_OUTER = 17
 
+# Head-pose landmark indices (6-point model used with solvePnP)
 NOSE_TIP = 1
 CHIN = 152
 LEFT_EYE_CORNER = 33
@@ -43,16 +54,27 @@ RIGHT_EYE_CORNER = 263
 MOUTH_LEFT_CORNER = 61
 MOUTH_RIGHT_CORNER = 291
 
+# Generic 3D face model points (mm), used as a reference for pose estimation.
+# These aren't this specific user's face geometry - they're a stand-in average
+# face shape, which is standard practice and works well enough for pitch/yaw.
 MODEL_3D_POINTS = np.array([
-    (0.0, 0.0, 0.0),
-    (0.0, -330.0, -65.0),
-    (-225.0, 170.0, -135.0),
-    (225.0, 170.0, -135.0),
-    (-150.0, -150.0, -125.0),
-    (150.0, -150.0, -125.0),
+    (0.0, 0.0, 0.0),         # Nose tip
+    (0.0, -330.0, -65.0),    # Chin
+    (-225.0, 170.0, -135.0),  # Left eye corner
+    (225.0, 170.0, -135.0),   # Right eye corner
+    (-150.0, -150.0, -125.0),  # Left mouth corner
+    (150.0, -150.0, -125.0),   # Right mouth corner
 ], dtype=np.float64)
 
-SMOOTHING_WINDOW = 5
+HEAD_PITCH_DOWN_THRESHOLD = 15   # degrees of downward head tilt to count as "nodding"
+NOD_CONSEC_FRAMES = 15           # consecutive nodding frames -> head-nod alert
+
+HEAD_PITCH_BACK_THRESHOLD = -15   # degrees of backward head tilt (head lolling back)
+BACK_TILT_CONSEC_FRAMES = 15      # consecutive backward-tilt frames -> alert
+
+# If eyes stay closed for this many consecutive frames (much longer than the
+# initial drowsy alert), escalate to a critical "high accident risk" alert.
+CRITICAL_EYE_CLOSED_FRAMES = 60
 
 
 def euclidean(p1, p2):
@@ -89,6 +111,11 @@ def draw_landmarks_subset(frame, landmarks, indices, w, h, color):
 
 
 def get_head_pitch(landmarks, w, h):
+    """Estimates head pitch (up/down tilt) in degrees using solvePnP.
+
+    Positive pitch = head tilted down (nodding forward), which is what we
+    want to detect. Returns None if pose estimation fails.
+    """
     image_points = np.array([
         (landmarks[NOSE_TIP].x * w, landmarks[NOSE_TIP].y * h),
         (landmarks[CHIN].x * w, landmarks[CHIN].y * h),
@@ -105,7 +132,7 @@ def get_head_pitch(landmarks, w, h):
         [0, focal_length, center[1]],
         [0, 0, 1],
     ], dtype=np.float64)
-    dist_coeffs = np.zeros((4, 1))
+    dist_coeffs = np.zeros((4, 1))  # assume no lens distortion
 
     success, rotation_vec, _ = cv2.solvePnP(
         MODEL_3D_POINTS, image_points, camera_matrix, dist_coeffs,
@@ -119,68 +146,133 @@ def get_head_pitch(landmarks, w, h):
     _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(pose_mat)
     pitch = euler_angles[0][0]
 
+    # Normalize: solvePnP/decompose can wrap pitch outside +-90 depending on
+    # head orientation; fold it back into an intuitive "down is positive" range.
     if pitch < -90:
         pitch = -(180 + pitch)
     elif pitch > 90:
         pitch = 180 - pitch
 
-    return -pitch
+    return -pitch  # flip sign so downward tilt is positive
 
 
-@st.cache_resource
-def load_landmarker():
+def alarm_loop(stop_event, frequency, pattern_gap):
+    """Beeps repeatedly on a background thread until stop_event is set."""
+    while not stop_event.is_set():
+        winsound.Beep(frequency, 300)
+        stop_event.wait(pattern_gap)
+
+
+class Alarm:
+    """Starts/stops a background beeping thread, avoiding duplicate threads."""
+    def __init__(self, frequency, pattern_gap=0.2):
+        self.frequency = frequency
+        self.pattern_gap = pattern_gap
+        self._thread = None
+        self._stop_event = threading.Event()
+
+    def start(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=alarm_loop,
+                args=(self._stop_event, self.frequency, self.pattern_gap),
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+
+def siren_loop(stop_event):
+    """Alternates between two tones quickly - a more urgent 'siren' pattern
+    for the critical/high-accident-risk escalation."""
+    freqs = [1600, 2800]
+    i = 0
+    while not stop_event.is_set():
+        winsound.Beep(freqs[i % 2], 150)
+        i += 1
+
+
+class SirenAlarm:
+    """Same start/stop interface as Alarm, but plays an alternating siren tone."""
+    def __init__(self):
+        self._thread = None
+        self._stop_event = threading.Event()
+
+    def start(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=siren_loop, args=(self._stop_event,), daemon=True
+            )
+            self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+
+def main():
     base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
         num_faces=1,
     )
-    return vision.FaceLandmarker.create_from_options(options)
+    landmarker = vision.FaceLandmarker.create_from_options(options)
 
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        print("ERROR: Could not open webcam. Check camera permissions/index.")
+        return
 
-class DrowsinessProcessor(VideoProcessorBase):
-    """Runs on every incoming webcam frame in the browser session."""
+    eye_closed_counter = 0
+    mouth_open_counter = 0
+    nod_counter = 0
+    back_tilt_counter = 0
+    ear_history = deque(maxlen=SMOOTHING_WINDOW)
+    mar_history = deque(maxlen=SMOOTHING_WINDOW)
 
-    def __init__(self):
-        self.landmarker = load_landmarker()
-        self.start_time = time.time()
+    drowsy_alert_active = False
+    yawn_alert_active = False
+    nod_alert_active = False
+    back_tilt_alert_active = False
+    critical_alert_active = False
 
-        self.ear_history = deque(maxlen=SMOOTHING_WINDOW)
-        self.mar_history = deque(maxlen=SMOOTHING_WINDOW)
+    drowsy_alarm = Alarm(frequency=2500, pattern_gap=0.15)  # urgent, fast beeps
+    yawn_alarm = Alarm(frequency=1200, pattern_gap=0.6)     # gentler, slower beeps
+    nod_alarm = Alarm(frequency=1800, pattern_gap=0.3)      # mid-urgency beeps
+    back_alarm = Alarm(frequency=2000, pattern_gap=0.25)    # backward-tilt beeps
+    critical_alarm = SirenAlarm()                           # accident-risk siren
 
-        self.eye_closed_counter = 0
-        self.mouth_open_counter = 0
-        self.nod_counter = 0
-        self.back_tilt_counter = 0
+    prev_time = time.time()
+    start_time = time.time()
 
-        # Tunable thresholds - overwritten live from the sidebar each frame
-        self.ear_threshold = 0.21
-        self.ear_consec_frames = 20
-        self.mar_threshold = 0.6
-        self.mar_consec_frames = 15
-        self.head_pitch_down_threshold = 15
-        self.nod_consec_frames = 15
-        self.head_pitch_back_threshold = -15
-        self.back_tilt_consec_frames = 15
-        self.critical_eye_closed_frames = 60
+    print("Starting drowsiness detection. Press 'q' to quit.")
 
-        # Shared with the main Streamlit thread for on-page status display
-        self.status_text = "Starting..."
-        self.status_level = "ok"  # ok | warning | danger | critical
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to read frame from webcam.")
+            break
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)
-        h, w = img.shape[:2]
-
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        timestamp_ms = int((time.time() - self.start_time) * 1000)
-        result = self.landmarker.detect_for_video(mp_image, timestamp_ms)
+        timestamp_ms = int((time.time() - start_time) * 1000)
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
         status_text = "No face detected"
         status_color = (0, 165, 255)
-        status_level = "warning"
+
+        if not result.face_landmarks:
+            drowsy_alarm.stop()
+            yawn_alarm.stop()
+            nod_alarm.stop()
+            back_alarm.stop()
+            critical_alarm.stop()
 
         if result.face_landmarks:
             landmarks = result.face_landmarks[0]
@@ -190,171 +282,159 @@ class DrowsinessProcessor(VideoProcessorBase):
             ear = (left_ear + right_ear) / 2.0
             mar = mouth_aspect_ratio(landmarks, w, h)
 
-            self.ear_history.append(ear)
-            self.mar_history.append(mar)
-            smoothed_ear = sum(self.ear_history) / len(self.ear_history)
-            smoothed_mar = sum(self.mar_history) / len(self.mar_history)
+            ear_history.append(ear)
+            mar_history.append(mar)
+            smoothed_ear = sum(ear_history) / len(ear_history)
+            smoothed_mar = sum(mar_history) / len(mar_history)
 
-            draw_landmarks_subset(img, landmarks, LEFT_EYE + RIGHT_EYE, w, h, (0, 255, 0))
+            draw_landmarks_subset(frame, landmarks, LEFT_EYE + RIGHT_EYE, w, h, (0, 255, 0))
             draw_landmarks_subset(
-                img, landmarks,
+                frame, landmarks,
                 [MOUTH_TOP_OUTER, MOUTH_BOTTOM_OUTER, MOUTH_LEFT, MOUTH_RIGHT],
                 w, h, (255, 0, 255)
             )
 
-            # --- Eye closure / drowsiness ---
-            if smoothed_ear < self.ear_threshold:
-                self.eye_closed_counter += 1
+            # --- Eye closure / drowsiness logic ---
+            if smoothed_ear < EAR_THRESHOLD:
+                eye_closed_counter += 1
             else:
-                self.eye_closed_counter = 0
+                eye_closed_counter = 0
+                drowsy_alert_active = False
+                critical_alert_active = False
 
-            drowsy_active = self.eye_closed_counter >= self.ear_consec_frames
-            critical_active = self.eye_closed_counter >= self.critical_eye_closed_frames
+            if eye_closed_counter >= EAR_CONSEC_FRAMES:
+                drowsy_alert_active = True
 
-            # --- Yawn ---
-            if smoothed_mar > self.mar_threshold:
-                self.mouth_open_counter += 1
+            # Escalate to critical "high accident risk" if eyes stay closed
+            # far longer than the initial drowsy alert
+            if eye_closed_counter >= CRITICAL_EYE_CLOSED_FRAMES:
+                critical_alert_active = True
+
+            # --- Yawn logic ---
+            if smoothed_mar > MAR_THRESHOLD:
+                mouth_open_counter += 1
             else:
-                self.mouth_open_counter = 0
-            yawn_active = self.mouth_open_counter >= self.mar_consec_frames
+                mouth_open_counter = 0
+                yawn_alert_active = False
 
-            # --- Head pose ---
+            if mouth_open_counter >= MAR_CONSEC_FRAMES:
+                yawn_alert_active = True
+
+            # --- Head-nod (forward) / droop logic ---
             pitch = get_head_pitch(landmarks, w, h)
-            if pitch is not None and pitch > self.head_pitch_down_threshold:
-                self.nod_counter += 1
+            if pitch is not None and pitch > HEAD_PITCH_DOWN_THRESHOLD:
+                nod_counter += 1
             else:
-                self.nod_counter = 0
-            nod_active = self.nod_counter >= self.nod_consec_frames
+                nod_counter = 0
+                nod_alert_active = False
 
-            if pitch is not None and pitch < self.head_pitch_back_threshold:
-                self.back_tilt_counter += 1
+            if nod_counter >= NOD_CONSEC_FRAMES:
+                nod_alert_active = True
+
+            # --- Head tilted back logic (head lolling backward) ---
+            if pitch is not None and pitch < HEAD_PITCH_BACK_THRESHOLD:
+                back_tilt_counter += 1
             else:
-                self.back_tilt_counter = 0
-            back_tilt_active = self.back_tilt_counter >= self.back_tilt_consec_frames
+                back_tilt_counter = 0
+                back_tilt_alert_active = False
 
-            # Priority: critical > drowsy > back-tilt > nod > yawn > active
-            if critical_active:
-                status_text, status_color, status_level = "CRITICAL! HIGH ACCIDENT RISK - WAKE UP!", (0, 0, 255), "critical"
-            elif drowsy_active:
-                status_text, status_color, status_level = "DROWSINESS ALERT!", (0, 0, 255), "danger"
-            elif back_tilt_active:
-                status_text, status_color, status_level = "HEAD TILTED BACK - Possible microsleep", (255, 0, 180), "danger"
-            elif nod_active:
-                status_text, status_color, status_level = "HEAD NOD DETECTED - Fatigue sign", (0, 90, 255), "warning"
-            elif yawn_active:
-                status_text, status_color, status_level = "YAWN DETECTED - Fatigue sign", (0, 140, 255), "warning"
+            if back_tilt_counter >= BACK_TILT_CONSEC_FRAMES:
+                back_tilt_alert_active = True
+
+            # Priority: critical accident-risk > drowsy eyes > head tilted
+            # back > head nod forward > yawn (most to least urgent)
+            if critical_alert_active:
+                status_text = "CRITICAL! HIGH ACCIDENT RISK - WAKE UP!"
+                status_color = (0, 0, 255)
+                critical_alarm.start()
+                drowsy_alarm.stop()
+                nod_alarm.stop()
+                back_alarm.stop()
+                yawn_alarm.stop()
+            elif drowsy_alert_active:
+                status_text = "DROWSINESS ALERT!"
+                status_color = (0, 0, 255)
+                drowsy_alarm.start()
+                critical_alarm.stop()
+                nod_alarm.stop()
+                back_alarm.stop()
+                yawn_alarm.stop()
+            elif back_tilt_alert_active:
+                status_text = "HEAD TILTED BACK - Possible microsleep"
+                status_color = (255, 0, 180)
+                back_alarm.start()
+                critical_alarm.stop()
+                drowsy_alarm.stop()
+                nod_alarm.stop()
+                yawn_alarm.stop()
+            elif nod_alert_active:
+                status_text = "HEAD NOD DETECTED - Fatigue sign"
+                status_color = (0, 90, 255)
+                nod_alarm.start()
+                critical_alarm.stop()
+                drowsy_alarm.stop()
+                back_alarm.stop()
+                yawn_alarm.stop()
+            elif yawn_alert_active:
+                status_text = "YAWN DETECTED - Fatigue sign"
+                status_color = (0, 140, 255)
+                yawn_alarm.start()
+                critical_alarm.stop()
+                drowsy_alarm.stop()
+                nod_alarm.stop()
+                back_alarm.stop()
             else:
-                status_text, status_color, status_level = "Active", (0, 255, 0), "ok"
+                status_text = "Active"
+                status_color = (0, 255, 0)
+                critical_alarm.stop()
+                drowsy_alarm.stop()
+                yawn_alarm.stop()
+                nod_alarm.stop()
+                back_alarm.stop()
 
-            cv2.putText(img, f"EAR: {smoothed_ear:.2f}", (20, 30),
+            cv2.putText(frame, f"EAR: {smoothed_ear:.2f}", (20, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(img, f"MAR: {smoothed_mar:.2f}", (20, 60),
+            cv2.putText(frame, f"MAR: {smoothed_mar:.2f}", (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             if pitch is not None:
-                cv2.putText(img, f"Pitch: {pitch:.1f} deg", (20, 90),
+                cv2.putText(frame, f"Pitch: {pitch:.1f} deg", (20, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            if critical_active:
+            if critical_alert_active:
+                # flashing effect: alternate border thickness/brightness by frame parity
                 flash_color = (0, 0, 255) if int(time.time() * 4) % 2 == 0 else (255, 255, 255)
-                cv2.rectangle(img, (0, 0), (w, h), flash_color, 12)
-            elif drowsy_active:
-                cv2.rectangle(img, (0, 0), (w, h), (0, 0, 255), 8)
-            elif back_tilt_active:
-                cv2.rectangle(img, (0, 0), (w, h), (255, 0, 180), 8)
-            elif nod_active:
-                cv2.rectangle(img, (0, 0), (w, h), (0, 90, 255), 8)
+                cv2.rectangle(frame, (0, 0), (w, h), flash_color, 12)
+            elif drowsy_alert_active:
+                cv2.rectangle(frame, (0, 0), (w, h), (0, 0, 255), 8)
+            elif back_tilt_alert_active:
+                cv2.rectangle(frame, (0, 0), (w, h), (255, 0, 180), 8)
+            elif nod_alert_active:
+                cv2.rectangle(frame, (0, 0), (w, h), (0, 90, 255), 8)
 
-        cv2.putText(img, status_text, (20, h - 20),
+        # FPS counter
+        curr_time = time.time()
+        fps = 1.0 / (curr_time - prev_time) if curr_time != prev_time else 0.0
+        prev_time = curr_time
+        cv2.putText(frame, f"FPS: {int(fps)}", (w - 130, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+
+        cv2.putText(frame, status_text, (20, h - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
 
-        self.status_text = status_text
-        self.status_level = status_level
+        cv2.imshow("Driver Drowsiness Detection", frame)
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-
-# ---------------------------------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------------------------------
-st.set_page_config(page_title="Driver Drowsiness Detection", page_icon="🚗", layout="wide")
-
-st.title("🚗 Driver Drowsiness Detection")
-st.caption("Real-time browser-based drowsiness & fatigue monitoring using MediaPipe FaceLandmarker.")
-# Browser alarm
-st.markdown("""
-<script>
-let alarmAudio = null;
-
-function startAlarm() {
-    if (!alarmAudio) {
-        alarmAudio = new Audio(
-            "https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg"
-        );
-        alarmAudio.loop = true;
-    }
-
-    alarmAudio.play().catch(() => {});
-}
-
-function stopAlarm() {
-    if (alarmAudio) {
-        alarmAudio.pause();
-        alarmAudio.currentTime = 0;
-    }
-}
-</script>
-""", unsafe_allow_html=True)
-
-with st.sidebar:
-    st.header("Detection Settings")
-    ear_threshold = st.slider("EAR threshold (eye closed)", 0.10, 0.35, 0.21, 0.01)
-    ear_frames = st.slider("Eye-closed frames -> alert", 5, 60, 20)
-    mar_threshold = st.slider("MAR threshold (yawn)", 0.3, 1.0, 0.6, 0.05)
-    mar_frames = st.slider("Yawn frames -> alert", 5, 40, 15)
-    st.divider()
-    st.markdown(
-        "**Tip:** run it once, watch the live EAR value while blinking "
-        "normally vs. closing your eyes for a couple seconds, and set the "
-        "threshold roughly halfway between those two readings."
-    )
-
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    ctx = webrtc_streamer(
-    key="drowsiness-detection",
-    mode=WebRtcMode.SENDRECV,
-    video_processor_factory=DrowsinessProcessor,
-    media_stream_constraints={
-        "video": {
-            "width": {"ideal": 640},
-            "height": {"ideal": 480},
-            "frameRate": {"ideal": 15}
-        },
-        "audio": False,
-    },
-    async_processing=False,
-)
-
-with col2:
-    st.subheader("Status")
-    status_placeholder = st.empty()
-    st.caption("Alerts also flash as a colored border around the video.")
-    st.markdown(
-        "- 🟢 **Active** — normal\n"
-        "- 🟠 **Yawn / Head nod** — early fatigue sign\n"
-        "- 🔴 **Drowsiness alert** — eyes closed too long\n"
-        "- 🚨 **Critical** — high accident risk"
-    )
-
-if ctx.video_processor:
-    while ctx.state.playing:
-        level = ctx.video_processor.status_level
-        text = ctx.video_processor.status_text
-        icon = {"ok": "🟢", "warning": "🟠", "danger": "🔴", "critical": "🚨"}.get(level, "⚪")
-        status_placeholder.markdown(f"### {icon} {text}")
-        time.sleep(0.3)
-        if not ctx.state.playing:
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-else:
-    status_placeholder.markdown("### ⚪ Click **Start** above to begin")
+
+    drowsy_alarm.stop()
+    yawn_alarm.stop()
+    nod_alarm.stop()
+    back_alarm.stop()
+    critical_alarm.stop()
+    cap.release()
+    cv2.destroyAllWindows()
+    landmarker.close()
+
+
+if __name__ == "__main__":
+    main()
