@@ -280,6 +280,30 @@ st.set_page_config(page_title="Driver Drowsiness Detection", page_icon="🚗", l
 
 st.title("🚗 Driver Drowsiness Detection")
 st.caption("Real-time browser-based drowsiness & fatigue monitoring using MediaPipe FaceLandmarker.")
+# Browser alarm
+st.markdown("""
+<script>
+let alarmAudio = null;
+
+function startAlarm() {
+    if (!alarmAudio) {
+        alarmAudio = new Audio(
+            "https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg"
+        );
+        alarmAudio.loop = true;
+    }
+
+    alarmAudio.play().catch(() => {});
+}
+
+function stopAlarm() {
+    if (alarmAudio) {
+        alarmAudio.pause();
+        alarmAudio.currentTime = 0;
+    }
+}
+</script>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Detection Settings")
